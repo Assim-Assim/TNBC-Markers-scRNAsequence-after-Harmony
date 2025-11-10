@@ -1,0 +1,165 @@
+# =====================================================
+# Script to identify cluster identity and CSC cells in TNBC (Triple-Negative Breast Cancer)
+# =====================================================
+
+set.seed(1234)
+
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+
+# =====================================================
+# Step 1: Load your TNBC integrated data
+# =====================================================
+
+# ✅ غيّر الاسم حسب ملفك الناتج من التحليل السابق
+tnbc_data <- readRDS("C:/Users/Shather/Desktop/samples/combined_harmony.rds")
+
+# Check the structure
+str(tnbc_data)
+View(tnbc_data@meta.data)
+
+# =====================================================
+# Step 2: Visualization - See clustering and samples
+# =====================================================
+
+clusters <- DimPlot(tnbc_data, reduction = 'umap', group.by = 'seurat_clusters', label = TRUE)
+samples  <- DimPlot(tnbc_data, reduction = 'umap', group.by = 'sample')
+clusters | samples
+
+# =====================================================
+# Step 3: Find markers for all clusters
+# =====================================================
+
+all_markers <- FindAllMarkers(
+  tnbc_data,
+  logfc.threshold = 0.25,
+  min.pct = 0.1,
+  only.pos = TRUE,
+  test.use = 'wilcox'
+)
+
+write.csv(all_markers, "tnbc_all_clusters_markers.csv", row.names = FALSE)
+
+top_markers <- all_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 5, order_by = avg_log2FC)
+
+print(top_markers)
+
+# =====================================================
+# Step 4: Identify CSC (Cancer Stem Cell) markers
+# =====================================================
+
+csc_markers <- c(
+  'ALDH1A1', 'ALDH1A3', 'CD44', 'CD24', 'EPCAM',
+  'PROM1', 'SOX2', 'POU5F1', 'NANOG', 'KLF4',
+  'MYC', 'ABCG2', 'ITGA6', 'THY1'
+)
+
+available_csc_markers <- csc_markers[csc_markers %in% rownames(tnbc_data)]
+cat("✅ Available CSC markers in your data:", paste(available_csc_markers, collapse = ", "), "\n")
+
+# =====================================================
+# Step 5: Calculate CSC percentage per cluster
+# =====================================================
+
+cd44_positive <- WhichCells(tnbc_data, expression = CD44 > 1)
+cd24_negative <- WhichCells(tnbc_data, expression = CD24 < 0.5)
+csc_cells <- intersect(cd44_positive, cd24_negative)
+
+tnbc_data$is_csc <- ifelse(colnames(tnbc_data) %in% csc_cells, "CSC", "Non-CSC")
+
+csc_percentage <- tnbc_data@meta.data %>%
+  group_by(seurat_clusters) %>%
+  summarise(
+    total_cells = n(),
+    csc_cells = sum(is_csc == "CSC"),
+    csc_percentage = (csc_cells / total_cells) * 100
+  )
+
+print(csc_percentage)
+
+# =====================================================
+# Step 6: Visualize CSC distribution
+# =====================================================
+
+DimPlot(tnbc_data, reduction = 'umap', group.by = 'is_csc', cols = c("gray", "red"))
+FeaturePlot(tnbc_data, features = head(available_csc_markers, 4), min.cutoff = 'q10')
+VlnPlot(tnbc_data, features = head(available_csc_markers, 4), pt.size = 0.1)
+
+# =====================================================
+# Step 7: Find conserved markers for CSC-rich clusters
+# =====================================================
+
+high_csc_clusters <- csc_percentage %>%
+  filter(csc_percentage > 10) %>%
+  pull(seurat_clusters)
+
+cat("🔥 Clusters with high CSC percentage:", paste(high_csc_clusters, collapse = ", "), "\n")
+
+if (length(high_csc_clusters) > 0) {
+  for (cluster in high_csc_clusters) {
+    cat("\n=== Analyzing CSC-rich cluster", cluster, "===\n")
+    csc_cluster_markers <- FindMarkers(tnbc_data, ident.1 = cluster, only.pos = TRUE, min.pct = 0.25)
+    write.csv(csc_cluster_markers, paste0("csc_cluster_", cluster, "_markers.csv"))
+    print(head(csc_cluster_markers, 10))
+  }
+}
+
+# =====================================================
+# Step 8: CSC analysis per patient/sample
+# =====================================================
+
+csc_per_patient <- tnbc_data@meta.data %>%
+  group_by(sample) %>%
+  summarise(
+    total_cells = n(),
+    csc_cells = sum(is_csc == "CSC"),
+    csc_percentage = (csc_cells / total_cells) * 100
+  ) %>%
+  arrange(desc(csc_percentage))
+
+print(csc_per_patient)
+
+ggplot(csc_per_patient, aes(x = reorder(sample, -csc_percentage), y = csc_percentage)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "CSC Percentage per TNBC Patient",
+       x = "Patient Sample",
+       y = "CSC Percentage (%)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# =====================================================
+# Step 9: Advanced CSC scoring
+# =====================================================
+
+csc_markers_to_use <- available_csc_markers[1:min(5, length(available_csc_markers))]
+
+tnbc_data <- AddModuleScore(
+  tnbc_data,
+  features = list(csc_markers_to_use),
+  name = "CSC_Score"
+)
+
+# تحديد العتبة العليا (أعلى 25%)
+high_csc_threshold <- quantile(tnbc_data$CSC_Score1, 0.75)
+tnbc_data$high_csc_score <- ifelse(tnbc_data$CSC_Score1 > high_csc_threshold, "High", "Low")
+
+FeaturePlot(tnbc_data, features = "CSC_Score1", min.cutoff = 'q10') +
+  scale_colour_gradientn(colours = c("blue", "green", "yellow", "red"))
+
+DimPlot(tnbc_data, group.by = "high_csc_score")
+
+# =====================================================
+# Step 10: Save results
+# =====================================================
+
+saveRDS(tnbc_data, "tnbc_data_with_csc_analysis.rds")
+write.csv(csc_percentage, "csc_percentage_per_cluster.csv", row.names = FALSE)
+write.csv(csc_per_patient, "csc_percentage_per_patient.csv", row.names = FALSE)
+
+cat("\n🎉 CSC analysis completed!\n")
+cat("📊 CSC percentage per cluster saved\n")
+cat("👥 CSC percentage per patient saved\n")
+cat("💾 Updated object saved as 'tnbc_data_with_csc_analysis.rds'\n")
