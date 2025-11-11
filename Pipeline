@@ -4,37 +4,324 @@
 
 set.seed(1234)
 
+# Load required libraries
 library(Seurat)
 library(tidyverse)
 library(ggplot2)
+library(patchwork)
 
 # =====================================================
-# Step 1: Load your TNBC integrated data
+# Step 1: Load and prepare TNBC integrated data
 # =====================================================
 
-# ✅ غيّر الاسم حسب ملفك الناتج من التحليل السابق
-tnbc_data <- readRDS("C:/Users/Shather/Desktop/samples/combined_harmony.rds")
+cat("📁 Loading TNBC data...\n")
+tnbc_data <- readRDS("C:/Users/Shather/Desktop/samples/CSCsTNBC.combined.harmony.rds")
+
+# حل مشكلة JoinLayers بشكل نهائي
+cat("🔧 Solving JoinLayers issue...\n")
+DefaultAssay(tnbc_data) <- "RNA"
+
+# طريقة مؤكدة لحل مشكلة JoinLayers
+if (packageVersion("Seurat") >= "5.0.0") {
+  # للإصدارات الحديثة من Seurat
+  tnbc_data <- JoinLayers(tnbc_data)
+} else {
+  # للإصدارات القديمة
+  tnbc_data <- UpdateSeuratObject(tnbc_data)
+}
+
+# طريقة بديلة إذا ما اشتغل JoinLayers
+tryCatch({
+  tnbc_data <- JoinLayers(tnbc_data)
+}, error = function(e) {
+  cat("⚠️ JoinLayers failed, trying alternative method...\n")
+  # استخدم الـ assay الموجود مباشرة
+  DefaultAssay(tnbc_data) <- "RNA"
+})
 
 # Check the structure
-str(tnbc_data)
-View(tnbc_data@meta.data)
+cat("🔍 Data structure:\n")
+print(tnbc_data)
+cat("📊 Number of cells:", ncol(tnbc_data), "\n")
+cat("📈 Number of genes:", nrow(tnbc_data), "\n")
 
 # =====================================================
-# Step 2: Visualization - See clustering and samples
+# Step 2: Visualization - Clustering and samples
 # =====================================================
 
+cat("📈 Generating visualizations...\n")
 clusters <- DimPlot(tnbc_data, reduction = 'umap', group.by = 'seurat_clusters', label = TRUE)
-samples  <- DimPlot(tnbc_data, reduction = 'umap', group.by = 'sample')
-clusters | samples
+samples <- DimPlot(tnbc_data, reduction = 'umap', group.by = 'sample')
+
+# Combine plots
+combined_plot <- clusters | samples
+print(combined_plot)
+
+# Save visualization
+ggsave("tnbc_clusters_samples.png", combined_plot, width = 12, height = 6, dpi = 300)
 
 # =====================================================
-# Step 3: Find markers for all clusters
+# Step 3: Find markers for all clusters - الطريقة المؤكدة
 # =====================================================
 
-all_markers <- FindAllMarkers(
-  tnbc_data,
-  logfc.threshold = 0.25,
-  min.pct = 0.1,
+cat("🔬 Finding markers for all clusters...\n")
+
+# Set identities for marker finding
+Idents(tnbc_data) <- tnbc_data$seurat_clusters
+
+# الطريقة المؤكدة لحساب markers
+all_markers <- tryCatch({
+  FindAllMarkers(
+    tnbc_data,
+    logfc.threshold = 0.25,
+    min.pct = 0.1,
+    only.pos = TRUE,
+    test.use = 'wilcox'
+  )
+}, error = function(e) {
+  cat("⚠️ Wilcox test failed, trying ROC test...\n")
+  FindAllMarkers(
+    tnbc_data,
+    logfc.threshold = 0.25,
+    min.pct = 0.1,
+    only.pos = TRUE,
+    test.use = 'roc'  # استخدام test مختلف
+  )
+})
+
+# إذا فشلت جميع المحاولات، جرب مع معلمات أبسط
+if (nrow(all_markers) == 0) {
+  cat("⚠️ No markers found, trying with simpler parameters...\n")
+  all_markers <- FindAllMarkers(
+    tnbc_data,
+    logfc.threshold = 0.1,  # عتبة أقل
+    min.pct = 0.05,         # نسبة أقل
+    only.pos = TRUE
+  )
+}
+
+if (nrow(all_markers) > 0) {
+  cat("✅ Found", nrow(all_markers), "markers across", length(unique(all_markers$cluster)), "clusters\n")
+  
+  # Save all markers
+  write.csv(all_markers, "tnbc_all_clusters_markers.csv", row.names = FALSE)
+  saveRDS(all_markers, "tnbc_all_clusters_markers.rds")
+  
+  # Get top 5 markers per cluster
+  top_markers <- all_markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+  
+  print(top_markers)
+  write.csv(top_markers, "tnbc_top_markers_per_cluster.csv", row.names = FALSE)
+  saveRDS(top_markers, "tnbc_top_markers_per_cluster.rds")
+} else {
+  cat("❌ No markers could be identified. Check your data.\n")
+  # إنشاء data frame فارغ للمتابعة
+  all_markers <- data.frame()
+  top_markers <- data.frame()
+}
+
+# =====================================================
+# Step 4: Identify and analyze Cancer Stem Cells (CSCs)
+# =====================================================
+
+cat("🦠 Identifying Cancer Stem Cells...\n")
+
+# Define CSC markers for TNBC
+csc_markers <- c(
+  'ALDH1A1', 'ALDH1A3', 'CD44', 'CD24', 'EPCAM',
+  'PROM1', 'SOX2', 'POU5F1', 'NANOG', 'KLF4',
+  'MYC', 'ABCG2', 'ITGA6', 'THY1'
+)
+
+# Check available markers in data
+available_csc_markers <- csc_markers[csc_markers %in% rownames(tnbc_data)]
+cat("✅ Available CSC markers:", paste(available_csc_markers, collapse = ", "), "\n")
+
+# Calculate CSC percentage using CD44+ CD24- phenotype
+if ('CD44' %in% rownames(tnbc_data) & 'CD24' %in% rownames(tnbc_data)) {
+  cd44_positive <- WhichCells(tnbc_data, expression = CD44 > 0.5)  # عتبة أقل
+  cd24_negative <- WhichCells(tnbc_data, expression = CD24 < 1)    # عتبة أقل
+  csc_cells <- intersect(cd44_positive, cd24_negative)
+  
+  tnbc_data$is_csc <- ifelse(colnames(tnbc_data) %in% csc_cells, "CSC", "Non-CSC")
+  cat("🔢 Identified", length(csc_cells), "CSC cells (CD44+ CD24-)\n")
+} else {
+  cat("⚠️ CD44 or CD24 not found in data, using alternative markers\n")
+  # استخدام markers بديلة إذا CD44 أو CD24 غير موجودين
+  if (length(available_csc_markers) > 0) {
+    tnbc_data$is_csc <- "Unknown"
+  }
+}
+
+# =====================================================
+# Step 5: CSC percentage analysis
+# =====================================================
+
+cat("📊 Calculating CSC percentages...\n")
+
+# CSC percentage per cluster
+csc_percentage <- tnbc_data@meta.data %>%
+  group_by(seurat_clusters) %>%
+  summarise(
+    total_cells = n(),
+    csc_cells = sum(is_csc == "CSC"),
+    csc_percentage = ifelse(total_cells > 0, (csc_cells / total_cells) * 100, 0)
+  ) %>%
+  arrange(desc(csc_percentage))
+
+print(csc_percentage)
+write.csv(csc_percentage, "csc_percentage_per_cluster.csv", row.names = FALSE)
+
+# CSC percentage per patient
+csc_per_patient <- tnbc_data@meta.data %>%
+  group_by(sample) %>%
+  summarise(
+    total_cells = n(),
+    csc_cells = sum(is_csc == "CSC"),
+    csc_percentage = ifelse(total_cells > 0, (csc_cells / total_cells) * 100, 0)
+  ) %>%
+  arrange(desc(csc_percentage))
+
+print(csc_per_patient)
+write.csv(csc_per_patient, "csc_percentage_per_patient.csv", row.names = FALSE)
+
+# =====================================================
+# Step 6: Visualize CSC distribution
+# =====================================================
+
+cat("📈 Visualizing CSC distribution...\n")
+
+# CSC UMAP plot
+csc_umap <- DimPlot(tnbc_data, reduction = 'umap', group.by = 'is_csc', 
+                   cols = c("gray", "red", "blue")) +
+  ggtitle("CSC Distribution")
+print(csc_umap)
+ggsave("csc_umap_distribution.png", csc_umap, width = 8, height = 6, dpi = 300)
+
+# CSC marker expression plots
+if (length(available_csc_markers) > 0) {
+  tryCatch({
+    feature_plot <- FeaturePlot(tnbc_data, features = head(available_csc_markers, 4), 
+                               min.cutoff = 'q10', ncol = 2)
+    print(feature_plot)
+    ggsave("csc_markers_expression.png", feature_plot, width = 10, height = 8, dpi = 300)
+  }, error = function(e) {
+    cat("⚠️ FeaturePlot failed for some markers\n")
+  })
+}
+
+# =====================================================
+# Step 7: Advanced CSC analysis
+# =====================================================
+
+cat("🔍 Performing advanced CSC analysis...\n")
+
+# Find CSC-rich clusters (clusters with >5% CSCs)
+high_csc_clusters <- csc_percentage %>%
+  filter(csc_percentage > 5) %>%
+  pull(seurat_clusters)
+
+cat("🔥 Clusters with high CSC percentage (>5%):", paste(high_csc_clusters, collapse = ", "), "\n")
+
+# CSC scoring using multiple markers
+if (length(available_csc_markers) >= 3) {
+  tryCatch({
+    tnbc_data <- AddModuleScore(
+      tnbc_data,
+      features = list(available_csc_markers),
+      name = "CSC_Score"
+    )
+    
+    # Define high CSC score threshold (top 25%)
+    high_csc_threshold <- quantile(tnbc_data$CSC_Score1, 0.75, na.rm = TRUE)
+    tnbc_data$high_csc_score <- ifelse(tnbc_data$CSC_Score1 > high_csc_threshold, "High", "Low")
+    
+    # Visualize CSC scores
+    csc_score_plot <- FeaturePlot(tnbc_data, features = "CSC_Score1", min.cutoff = 'q10') +
+
+scale_colour_gradientn(colours = c("blue", "green", "yellow", "red")) +
+      ggtitle("CSC Module Score")
+    
+    print(csc_score_plot)
+    ggsave("csc_module_score.png", csc_score_plot, width = 8, height = 6, dpi = 300)
+  }, error = function(e) {
+    cat("⚠️ CSC scoring failed\n")
+  })
+}
+
+# =====================================================
+# Step 8: Patient-wise CSC analysis visualization
+# =====================================================
+
+cat("👥 Generating patient-wise analysis...\n")
+
+# Bar plot for CSC percentage per patient
+if (nrow(csc_per_patient) > 0) {
+  patient_plot <- ggplot(csc_per_patient, aes(x = reorder(sample, -csc_percentage), y = csc_percentage)) +
+    geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +
+    theme_minimal() +
+    labs(title = "CSC Percentage per TNBC Patient",
+         x = "Patient Sample",
+         y = "CSC Percentage (%)") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    geom_text(aes(label = round(csc_percentage, 1)), vjust = -0.5, size = 3)
+  
+  print(patient_plot)
+  ggsave("csc_per_patient.png", patient_plot, width = 10, height = 6, dpi = 300)
+}
+
+# =====================================================
+# Step 9: Save all results comprehensively
+# =====================================================
+
+cat("💾 Saving all results...\n")
+
+# Save the main Seurat object with CSC analysis
+saveRDS(tnbc_data, "tnbc_data_with_csc_analysis.rds")
+
+# Create a comprehensive results list
+results_summary <- list(
+  all_markers = all_markers,
+  top_markers = top_markers,
+  csc_percentage_cluster = csc_percentage,
+  csc_percentage_patient = csc_per_patient,
+  available_csc_markers = available_csc_markers,
+  high_csc_clusters = high_csc_clusters,
+  total_cells = ncol(tnbc_data),
+  total_genes = nrow(tnbc_data)
+)
+
+# Save comprehensive results
+saveRDS(results_summary, "tnbc_csc_comprehensive_results.rds")
+
+# =====================================================
+# Step 10: Final summary report
+# =====================================================
+
+cat("\n🎉 TNBC CLUSTER IDENTITY AND CSC ANALYSIS COMPLETED!\n")
+cat("====================================================\n")
+cat("📊 Total clusters analyzed:", length(unique(tnbc_data$seurat_clusters)), "\n")
+cat("🔬 Total markers identified:", nrow(all_markers), "\n")
+cat("🦠 Total CSC cells identified:", sum(tnbc_data$is_csc == "CSC", na.rm = TRUE), "\n")
+if (nrow(csc_per_patient) > 0) {
+  cat("📈 Overall CSC percentage:", round(mean(csc_per_patient$csc_percentage, na.rm = TRUE), 2), "%\n")
+}
+cat("🔥 High-CSC clusters (>5%):", paste(high_csc_clusters, collapse = ", "), "\n")
+cat("💾 Files saved:\n")
+cat("   - tnbc_data_with_csc_analysis.rds (Main data object)\n")
+cat("   - tnbc_csc_comprehensive_results.rds (All results)\n")
+cat("   - tnbc_all_clusters_markers.csv & .rds (All markers)\n")
+cat("   - tnbc_top_markers_per_cluster.csv & .rds (Top markers)\n")
+cat("   - csc_percentage_per_cluster.csv\n")
+cat("   - csc_percentage_per_patient.csv\n")
+cat("   - Multiple visualization PNG files\n")
+cat("====================================================\n")
+
+# Print session info for reproducibility
+cat("\n📋 Session info:\n")
+print(sessionInfo())  min.pct = 0.1,
   only.pos = TRUE,
   test.use = 'wilcox'
 )
